@@ -33,7 +33,7 @@ jobs:
           }
 
           if (-not $tag.StartsWith("v")) {
-              throw "Release tag must start with 'v'. Example: v1.0.0.0.1"
+              throw "Release tag must start with 'v'. Example: v1.0.0.0"
           }
 
           Write-Host "Release tag: $tag"
