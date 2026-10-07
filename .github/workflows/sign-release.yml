@@ -1,4 +1,3 @@
-yaml
 name: Build, Sign and Release ZelvInstallerSetup
 
 on:
@@ -302,6 +301,7 @@ jobs:
 
       # ==========================================================
       # 12. Create GitHub Release
+      #     Only SetupInstaller.exe is uploaded
       # ==========================================================
 
       - name: Create GitHub Release
@@ -314,7 +314,6 @@ jobs:
           gh release create `
               "$tag" `
               "${{ github.workspace }}\publish\SetupInstaller.exe" `
-              "${{ github.workspace }}\SetupInstaller.exe.sha256" `
               --repo "${{ github.repository }}" `
               --title "Zelv Setup Installer $tag" `
               --generate-notes
@@ -324,6 +323,7 @@ jobs:
           }
 
           Write-Host "GitHub release created successfully."
+          Write-Host "Only SetupInstaller.exe was uploaded."
 
       # ==========================================================
       # 13. Destroy PFX
