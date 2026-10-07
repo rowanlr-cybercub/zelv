@@ -1,0 +1,371 @@
+yaml
+name: Build, Sign and Release ZelvInstallerSetup
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0.0.0.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-sign-release:
+    name: Build, Sign and Release ZelvInstallerSetup
+    runs-on: windows-latest
+    environment: install-setup-signing
+
+    steps:
+
+      # ==========================================================
+      # 1. Validate release tag
+      # ==========================================================
+
+      - name: Validate Release Tag
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag }}"
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+              throw "Release tag cannot be empty."
+          }
+
+          if (-not $tag.StartsWith("v")) {
+              throw "Release tag must start with 'v'. Example: v1.0.0.0.1"
+          }
+
+          Write-Host "Release tag: $tag"
+
+      # ==========================================================
+      # 2. Checkout source
+      # ==========================================================
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ==========================================================
+      # 3. Setup .NET
+      # ==========================================================
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      # ==========================================================
+      # 4. Restore
+      # ==========================================================
+
+      - name: Restore
+        shell: pwsh
+        run: |
+          dotnet restore .\ZelvInstallerSetup.slnx
+
+      # ==========================================================
+      # 5. Build
+      # ==========================================================
+
+      - name: Build
+        shell: pwsh
+        run: |
+          dotnet build .\ZelvInstallerSetup.slnx `
+            -c Release `
+            --no-restore
+
+      # ==========================================================
+      # 6. Publish single-file SetupInstaller.exe
+      # ==========================================================
+
+      - name: Publish SetupInstaller
+        shell: pwsh
+        run: |
+          $publishDir = "${{ github.workspace }}\publish"
+
+          dotnet publish `
+              .\ZelvInstallerSetup\ZelvInstallerSetup.csproj `
+              -c Release `
+              -r win-x64 `
+              --self-contained true `
+              --no-restore `
+              -p:PublishSingleFile=true `
+              -p:IncludeNativeLibrariesForSelfExtract=true `
+              -p:EnableCompressionInSingleFile=true `
+              -p:PublishTrimmed=false `
+              -p:AssemblyName=SetupInstaller `
+              -o "$publishDir"
+
+          $publishedExe = Join-Path $publishDir "SetupInstaller.exe"
+
+          if (-not (Test-Path $publishedExe)) {
+              throw "SetupInstaller.exe was not produced by dotnet publish."
+          }
+
+          $file = Get-Item $publishedExe
+
+          Write-Host "Published installer:"
+          Write-Host $file.FullName
+          Write-Host "Size: $($file.Length) bytes"
+
+          if ($file.Length -lt 100000) {
+              throw "SetupInstaller.exe appears unexpectedly small."
+          }
+
+      # ==========================================================
+      # 7. Decode Zelv signing certificate
+      # ==========================================================
+
+      - name: Decode Zelv Signing Certificate
+        shell: pwsh
+        env:
+          BASE64_PFX: ${{ secrets.INSTALL_SETUP_PFX_BASE64 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:BASE64_PFX)) {
+              throw "INSTALL_SETUP_PFX_BASE64 secret is missing."
+          }
+
+          $certificatePath =
+              "${{ github.workspace }}\zelv_signing.pfx"
+
+          try {
+              $bytes = [Convert]::FromBase64String(
+                  $env:BASE64_PFX
+              )
+
+              [IO.File]::WriteAllBytes(
+                  $certificatePath,
+                  $bytes
+              )
+          }
+          catch {
+              throw "INSTALL_SETUP_PFX_BASE64 is not valid Base64."
+          }
+
+          if (-not (Test-Path $certificatePath)) {
+              throw "Zelv signing certificate could not be created."
+          }
+
+          $size = (Get-Item $certificatePath).Length
+
+          Write-Host "Temporary Zelv PFX created."
+          Write-Host "PFX size: $size bytes"
+
+      # ==========================================================
+      # 8. Locate SignTool
+      # ==========================================================
+
+      - name: Locate SignTool
+        id: signtool
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem `
+              -Path "C:\Program Files (x86)\Windows Kits" `
+              -Filter "signtool.exe" `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Where-Object {
+                  $_.FullName -match "\\x64\\signtool\.exe$"
+              } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+
+          if (-not $signtool) {
+              throw "SignTool.exe could not be found."
+          }
+
+          Write-Host "Using SignTool:"
+          Write-Host $signtool.FullName
+
+          "PATH=$($signtool.FullName)" >> $env:GITHUB_OUTPUT
+
+      # ==========================================================
+      # 9. Sign SetupInstaller.exe
+      # ==========================================================
+
+      - name: Sign SetupInstaller.exe
+        shell: pwsh
+        env:
+          CERT_PASSWORD: ${{ secrets.INSTALL_SETUP_CERT_PASSWORD }}
+        run: |
+          $signtool =
+              "${{ steps.signtool.outputs.PATH }}"
+
+          $certificate =
+              "${{ github.workspace }}\zelv_signing.pfx"
+
+          $exe =
+              "${{ github.workspace }}\publish\SetupInstaller.exe"
+
+          if (-not (Test-Path $certificate)) {
+              throw "Zelv signing certificate does not exist."
+          }
+
+          if (-not (Test-Path $exe)) {
+              throw "SetupInstaller.exe does not exist."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:CERT_PASSWORD)) {
+              throw "INSTALL_SETUP_CERT_PASSWORD secret is missing."
+          }
+
+          & $signtool sign `
+              /f "$certificate" `
+              /p "$env:CERT_PASSWORD" `
+              /fd SHA256 `
+              /tr "http://timestamp.digicert.com" `
+              /td SHA256 `
+              /d "Zelv Setup Installer" `
+              "$exe"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "SignTool failed with exit code $LASTEXITCODE."
+          }
+
+          Write-Host "SetupInstaller.exe signed successfully."
+
+      # ==========================================================
+      # 10. Verify Authenticode signature
+      # ==========================================================
+
+      - name: Verify Digital Signature
+        shell: pwsh
+        env:
+          EXPECTED_THUMBPRINT: ${{ secrets.INSTALL_SETUP_CERT_THUMBPRINT }}
+        run: |
+          $exe =
+              "${{ github.workspace }}\publish\SetupInstaller.exe"
+
+          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_THUMBPRINT)) {
+              throw "INSTALL_SETUP_CERT_THUMBPRINT secret is missing."
+          }
+
+          $signature = Get-AuthenticodeSignature $exe
+
+          Write-Host "Signature Status:"
+          Write-Host $signature.Status
+
+          if (-not $signature.SignerCertificate) {
+              throw "No signing certificate was found."
+          }
+
+          $actual =
+              $signature.SignerCertificate.Thumbprint.Replace(" ", "").ToUpperInvariant()
+
+          $expected =
+              $env:EXPECTED_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
+
+          Write-Host "Signer:"
+          Write-Host $signature.SignerCertificate.Subject
+
+          Write-Host "Thumbprint:"
+          Write-Host $actual
+
+          Write-Host "Certificate expires:"
+          Write-Host $signature.SignerCertificate.NotAfter
+
+          if ($actual -ne $expected) {
+              throw "Signing certificate thumbprint does not match the expected Zelv certificate."
+          }
+
+          if ($signature.Status -ne "Valid") {
+              throw "Authenticode verification failed: $($signature.Status)"
+          }
+
+          Write-Host "Authenticode signature is valid."
+          Write-Host "Zelv certificate thumbprint verified."
+
+      # ==========================================================
+      # 11. Generate SHA-256
+      # ==========================================================
+
+      - name: Generate SHA-256
+        shell: pwsh
+        run: |
+          $exe =
+              "${{ github.workspace }}\publish\SetupInstaller.exe"
+
+          $hash = (
+              Get-FileHash `
+                  -Path $exe `
+                  -Algorithm SHA256
+          ).Hash
+
+          Write-Host "SHA-256:"
+          Write-Host $hash
+
+          "$hash  SetupInstaller.exe" |
+              Out-File `
+                  "${{ github.workspace }}\SetupInstaller.exe.sha256" `
+                  -Encoding ascii
+
+      # ==========================================================
+      # 12. Create GitHub Release
+      # ==========================================================
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ inputs.tag }}"
+
+          gh release create `
+              "$tag" `
+              "${{ github.workspace }}\publish\SetupInstaller.exe" `
+              "${{ github.workspace }}\SetupInstaller.exe.sha256" `
+              --repo "${{ github.repository }}" `
+              --title "Zelv Setup Installer $tag" `
+              --generate-notes
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to create GitHub release $tag."
+          }
+
+          Write-Host "GitHub release created successfully."
+
+      # ==========================================================
+      # 13. Destroy PFX
+      # ==========================================================
+
+      - name: Destroy Temporary Certificate
+        if: always()
+        shell: pwsh
+        run: |
+          $certificate =
+              "${{ github.workspace }}\zelv_signing.pfx"
+
+          if (Test-Path $certificate) {
+              Remove-Item `
+                  "$certificate" `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+              Write-Host "Temporary Zelv PFX deleted."
+          }
+
+      # ==========================================================
+      # 14. Clean runner files
+      # ==========================================================
+
+      - name: Clean Runner Files
+        if: always()
+        shell: pwsh
+        run: |
+          $files = @(
+              "${{ github.workspace }}\publish\SetupInstaller.exe",
+              "${{ github.workspace }}\SetupInstaller.exe.sha256",
+              "${{ github.workspace }}\zelv_signing.pfx"
+          )
+
+          foreach ($file in $files) {
+              if (Test-Path $file) {
+                  Remove-Item `
+                      "$file" `
+                      -Force `
+                      -ErrorAction SilentlyContinue
+              }
+          }
+
+          Write-Host "Temporary runner files cleaned."
